@@ -1,0 +1,11 @@
+.venv
+.gradio
+__pycache__
+app_video1.py 
+pipeline1.py 
+video_stats.csv
+ARY_Digital_Logo.png
+venv_new
+logo_audio.wav
+logo_index.faiss
+metadata.json
