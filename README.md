@@ -3,11 +3,14 @@
 An application for semi-automated logo detection in brand advertisement videos using multimodal machine learning.
 
 ## Overview
+![Flowchart](assets/logo_detection_pipeline.png)
+
 This is an application that allow detection of logos in non-English brand advertisment videos using multimodal ML techniques. The overall pipeline is:
 - Run the `Whisper` model on audio of the advertisement to transcribe it from the source language (Italian for e.g.) to English.
 - Apply an LLM like `Qwen 2.5` to obtain all brand names mentioned in the audio transcript.
 - Run _shot detection_ on the video to obtain the most distinct, relevant keyframes.
 - On each keyframe, run a _zero-shot object detection_ model such as `OWLv2` with prompt to extract as many _logo-like_ regions as possible i.e. crops that may contain an actual logo.
+- Some of the regions that are not logos i.e. false positives are removed using CLIP-based filtering.
 - All of the crops/regions then run through the following brand assignment techniques:
   - Use `CLIP` model to assign each region a brand from a list of top ~2000 brands (Netflix, Apple, etc.) obtained publicly from Kaggle.
   - Use `Optical Character Recognition (OCR)` along with `fuzzy string matching` to assign leftover regions a brand from the brand names extracted from the audio.
@@ -22,10 +25,10 @@ This is an application that allow detection of logos in non-English brand advert
 - Vector stores like FAISS enable continual learning and detection of new logos over time.
 - Overall pipeline is agnostic to the domain (Ads, sports, etc.) and the source language.
 
- ## Challenges
+ ## Challenges & Limitations
  - Some false positives obtained from OWLv2 pass unfiltered through the remaining pipeline.
  - If a brand is not popular, not present in the vector store, and is not mentioned in the audio explicitly, it's logos will not be detected.
- - Currently, the pipeline runs slower than would be ideal.
+ - Currently, the pipeline runs slower than would be ideal. We are trying to implement optimizations such as replacing CLIP-based filtering with heuristic-based filtering, replacing EasyOCR with PaddleOCR, and using batched version of RapidFuzz for fuzzy matching.
 
 ## Usage
 1. Clone the Repository.
