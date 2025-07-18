@@ -26,3 +26,13 @@ This is an application that allow detection of logos in non-English brand advert
  - Some false positives obtained from OWLv2 pass unfiltered through the remaining pipeline.
  - If a brand is not popular, not present in the vector store, and is not mentioned in the audio explicitly, it's logos will not be detected.
  - Currently, the pipeline runs slower than would be ideal.
+
+## Usage
+1. Clone the Repository.
+2. Set up and activate a python virtual environment (optional).
+3. Run `pip install requirements.txt` to install the necessary dependencies.
+4. Run `gradio gradio_app.py` to launch the gradio UI.
+6. Upload a short brand advertisement video of your choice.
+7. Type or copy-paste your `HuggingFace Hub` API key. You can obtain this for free.
+8. Click on `Run Pipeline` to run the pipeline.
+9. View the logos detected with corresponding brand names and timestamps on the right after pipeline finishes.
