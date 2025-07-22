@@ -6,11 +6,13 @@ import uuid
 from filtering.clip_filtering import CLIPModel, positive_prompts, negative_prompts, detect_brands_clip
 import pandas as pd
 import re
-from utils.fuzzy_matching import combine_easyocr_text_ordered, get_ocr_image, robust_fuzzy_match
+from utils.fuzzy_matching import combine_easyocr_text_ordered, get_ocr_image, robust_fuzzy_match, robust_fuzzy_match_batch
 import numpy as np
 from tqdm import tqdm
 import multiprocessing as mp
 from functools import partial
+from typing import List, Dict, Any
+import albumentations as A
 # --- 1. LogoImage Data Model ---
 
 @dataclass
@@ -24,7 +26,7 @@ class LogoImage:
         return LogoImage(
             id=str(uuid.uuid4()),
             image=image,
-            metadata=metadata or {}
+            metadata=metadata or {},
         )
 
 # --- 2. Abstract Brand Recognition Technique ---
@@ -216,10 +218,64 @@ class OcrFuzzyTechnique(BrandRecognitionTechnique):
             }
 
         return results
+    
+
+class OcrFuzzyBatchTechnique(BrandRecognitionTechnique):
+    def __init__(
+        self,
+        ocr_func,
+        fuzzy_matcher,
+        known_brands: List[str],
+        fuzzy_threshold: float = 0.8
+    ):
+        """
+        Args:
+            ocr_func: Callable that takes a PIL Image and returns OCR text.
+            known_brands: List of canonical brand names.
+            fuzzy_threshold: Float in [0,1], converted internally to 0–100.
+        """
+        self.ocr_func = ocr_func
+        self.fuzzy_matcher = fuzzy_matcher
+        # Pre-normalize your brand list
+        self.known_brands = [b.lower().strip() for b in known_brands]
+        # Map to an integer threshold for RapidFuzz (0–100)
+        self.base_threshold = int(fuzzy_threshold * 100)
+
+    def predict(self, logo_images: List[LogoImage]) -> Dict[str, Dict[str, Any]]:
+        results: Dict[str, Dict[str, Any]] = {}
+
+        # 1. Extract all OCR texts in one pass
+        ocr_texts = []
+        for logo in logo_images:
+            raw = self.ocr_func(logo.image) or ""
+            ocr_texts.append(raw.strip())
+
+        # 2. Batch fuzzy‐match them against known_brands
+        matches = self.fuzzy_matcher(
+            texts=ocr_texts,
+            brand_list=self.known_brands,
+            base_threshold=self.base_threshold
+        )
+
+        # 3. Unpack into your results dict
+        for logo, ocr_txt, (brand, score) in zip(logo_images, ocr_texts, matches):
+            results[logo.id] = {
+                "brand":       brand,
+                "fuzzy_score": score,
+                "ocr_text":    ocr_txt
+            }
+
+        return results
 
 
 # --- 5. FAISS + OCR + Fuzzy Matching Brand Recognition Technique ---
-
+AUGMENTATIONS = A.Compose([
+    A.Rotate(limit=10, p=0.5),
+    A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.5),
+    A.MotionBlur(blur_limit=3, p=0.3),
+    A.ColorJitter(hue=0.05, saturation=0.1, p=0.4),
+    A.Resize(224, 224)
+])
 
 class DatabaseFaissTechnique(BrandRecognitionTechnique):
     def __init__(self, db, ocr_reader, base_threshold: int = 75, faiss_threshold: float = 0.85, min_text_len: int = 3):
@@ -337,5 +393,97 @@ class DatabaseFaissParallelTechnique(BrandRecognitionTechnique):
         # Collect results
         for logo_id, result in logo_result_pairs:
             results[logo_id] = result
+
+        return results
+
+
+# --- Refactored Technique ---
+class DatabaseFaissTechniqueBatch(BrandRecognitionTechnique):
+    def __init__(
+        self,
+        db,
+        ocr_reader,
+        base_threshold: int = 75,
+        faiss_threshold: float = 0.85,
+        min_text_len: int = 3,
+    ):
+        self.db = db
+        self.ocr_reader = ocr_reader
+        self.base_threshold = base_threshold
+        self.faiss_threshold = faiss_threshold
+        self.min_text_len = min_text_len
+
+    def _extract_clean_text(self, image: Image.Image) -> str:
+        text = get_ocr_image(image).strip().lower()
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"[^a-z\s]", "", text)
+        return text
+
+    def predict(self, logo_images: List[LogoImage]) -> Dict[str, Any]:
+        results = {}
+
+        # 1) Batch FAISS search on all images
+        images = [logo.image for logo in logo_images]
+        batch_search = self.db.search_logos(
+            images,
+            threshold=self.faiss_threshold,
+            k=5,
+            batch_size=self.db.batch_size,
+            augmentations=AUGMENTATIONS,
+            num_augments=3,
+        )
+        # batch_search[i] is a list of up to k matches dicts for logo i
+
+        # 2) Extract OCR texts
+        ocr_texts = [self._extract_clean_text(img) for img in images]
+
+        # 3) Pick top-1 db_text per image (or "" if none)
+        top_db_texts  = []
+        top_db_scores = []
+        for matches in batch_search:
+            if matches:
+                bm = matches[0]
+                top_db_texts.append(bm["brand_name"].lower().strip())
+                top_db_scores.append(bm["similarity"])
+            else:
+                top_db_texts.append("")
+                top_db_scores.append(0.0)
+
+
+        # print(top_db_texts, top_db_scores)
+
+        # 4) Batch‐match OCR→DB strings
+        matched_texts = robust_fuzzy_match_batch(
+            ocr_texts,
+            top_db_texts,
+            base_threshold=self.base_threshold,
+            min_text_len=self.min_text_len,
+        )
+
+        # 5) Build results
+        for idx, logo in enumerate(logo_images):
+            db_text  = top_db_texts[idx]
+            db_score = top_db_scores[idx]
+            ocr_txt  = ocr_texts[idx]
+            best_match = matched_texts[idx]
+
+            # If no FAISS hit at all
+            if not batch_search[idx]:
+                brand = "UNKNOWN"
+            # Special case: design-only query image but high FAISS confidence
+            # elif (not ocr_txt or (len(ocr_txt) == 0)) and db_score >= 0.93:
+            elif not ocr_txt and not db_text and db_score >= 0.93:
+                brand = db_text
+                best_match = db_text
+            # Successful FAISS + fuzzy match
+            else:
+                brand = best_match if best_match != "UNKNOWN" else "UNKNOWN"
+
+            results[logo.id] = {
+                "brand":       brand,
+                "ocr_text":    ocr_txt,
+                "matched_text": best_match if best_match != "UNKNOWN" else None,
+                "score":       db_score
+            }
 
         return results
