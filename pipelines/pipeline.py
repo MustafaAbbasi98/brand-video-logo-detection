@@ -3,6 +3,7 @@ from models.detector_model import LogoDetector
 from models.description_model import Qwen2_5VLModel, Qwen2_5TextModel
 from filtering.llm_filtering import process_image, LLMResult
 from filtering.clip_filtering import CLIPModel, positive_prompts, negative_prompts, cluster_hard_cases, detect_brands_clip
+from filtering.heuristic_filtering import FilterPipeline, area_aspect_filter, texture_filter, edge_density_filter, color_variance_filter
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
@@ -11,11 +12,17 @@ import math
 from typing import List
 from PIL import Image
 import os
+import re
 from utils.prompts import QWEN_TRANSCRIPT_LOGO_SYSTEM_PROMPT, QWEN_TRANSCRIPT_LOGO_PROMPT
 from models.audio_model import WhisperModel, convert_video_to_audio
-from utils.fuzzy_matching import get_ocr_image, smart_fuzzy_brand_match
-from brand_recognition_chain import BrandRecognizer, LogoImage, OcrFuzzyTechnique, ClipTechnique, DatabaseFaissTechnique, DatabaseFaissParallelTechnique
-from models.faiss_db import LogoDatabase
+from utils.fuzzy_matching import get_ocr_image, smart_fuzzy_brand_match, smart_fuzzy_brand_match_batch
+from pipelines.brand_recognition_chain import BrandRecognizer, LogoImage, OcrFuzzyTechnique, OcrFuzzyBatchTechnique, ClipTechnique, DatabaseFaissTechnique, DatabaseFaissTechniqueBatch
+from models.faiss_db import LogoDatabase, LogoDatabaseNew
+# import albumentations as A
+
+
+
+
 
 def resize_images(images):
     """
@@ -48,6 +55,7 @@ def extract_audio_brands(video_path):
 
     #transcript extraction
     transcript, _ = whisper.run_example('logo_audio.wav')
+    # print(transcript)
     brand_string = qwen_text_model.run_example(
         QWEN_TRANSCRIPT_LOGO_PROMPT(transcript),
         QWEN_TRANSCRIPT_LOGO_SYSTEM_PROMPT
@@ -100,81 +108,234 @@ def filter_logos_with_clip(logo_images: List[LogoImage], clip_model, positive_pr
     return filtered_logo_images
 
 
+# def process_video(video_path, threshold, use_db=False):
+#     print('use_db', use_db)
+#     shot_detector = ShotDetector(video_path)
+#     detector  = LogoDetector()
+#     clip_model = CLIPModel()
+#     filter_pipeline = FilterPipeline([
+#         area_aspect_filter,
+#         texture_filter,
+#         edge_density_filter,
+#         color_variance_filter,
+#     ])
+
+#     # qwen_model = Qwen2_5VLModel()
+
+#     db_index_path =  "D:\\milestone 2\\faiss_db\\logo_index.faiss"
+#     metadata_path = "D:\\milestone 2\\faiss_db\\metadata.json"
+#     db = LogoDatabaseNew(db_index_path, metadata_path, batch_size=64)
+
+#     # audio_brands = extract_audio_brands(video_path)
+#     audio_brands = ['sky', 'neoborocillina', 'storeroom', 'merluzzo', 'nurofen', 'monifarma', 'moneypharm', 'verishure', 'verisure', 'barbie', 'chanted evening', 'orogel', 'rai sport', 'rai 2', 'guinness world records']
+#     # print(audio_brands)
+    
+#     #Video Shot Detection
+#     frames, frame_numbers, timestamps = shot_detector.process_video(quantile=threshold)
+#     print('Total Frames:', len(frames))
+
+#     #Object detection on all frames
+#     detector_results = detector.process_images(frames, threshold=0.03, nms_threshold=0.3, batch_size=16)
+#     # print(len(detector_results))
+#     # for result in detector_results:
+#     #     print(len(result['logos']))
+    
+#     frame_results = []
+#     for result, timestamp, frame_no in tqdm(zip(detector_results, timestamps, frame_numbers)):
+        
+#         logos, scores = result['logos'], result['scores']
+#         print("Total logos in frame: ", len(logos))
+#         if len(logos) <= 0:
+#             continue
+
+#         #Create LogoImage objects
+#         logo_images = []
+#         for idx, (logo, score) in enumerate(zip(logos, scores)):
+#             metadata = {
+#                 'frame_number': frame_no,
+#                 'timestamp': timestamp,
+#                 'logo_index': idx,
+#                 'score': score,
+#             }
+#             logo_image = LogoImage.create(logo, metadata)
+#             logo_images.append(logo_image)
+        
+#         #Filter out easy examples using CLIP
+#         if len(logo_images) >= 10:
+#             # logo_images = filter_logos_with_clip(logo_images, clip_model, positive_prompts, negative_prompts)
+#             logo_images = filter_pipeline.apply(logo_images)
+#             print(f"Filtered logos kept for frame {frame_no}: {len(logo_images)}")
+            
+#         if len(logo_images) == 0:
+#             continue
+    
+#         # Then run recognizer (same as earlier)
+#         techniques = [
+#             ClipTechnique(clip_model, clip_threshold=0.8),
+#             OcrFuzzyBatchTechnique(get_ocr_image, smart_fuzzy_brand_match_batch, audio_brands, fuzzy_threshold=0.8),
+#             # OcrFuzzyTechnique(get_ocr_image, smart_fuzzy_brand_match, audio_brands, fuzzy_threshold=0.8),
+#             # DatabaseFaissTechnique(db, get_ocr_image),
+#         ]
+
+#         if use_db:
+#             techniques.append(DatabaseFaissTechniqueBatch(db, get_ocr_image))
+
+#         recognizer = BrandRecognizer(techniques)
+#         frame_recognition_results = recognizer.recognize(logo_images)
+
+#         frame_results.append({
+#             'frame_number': frame_no,
+#             'timestamp': timestamp,
+#             'results': frame_recognition_results
+#         })
+
+#     print(frame_results)
+#     return frame_results
+
 def process_video(video_path, threshold, use_db=False):
     print('use_db', use_db)
-    shot_detector = ShotDetector(video_path)
-    detector  = LogoDetector()
-    clip_model = CLIPModel()
-    qwen_model = Qwen2_5VLModel()
+    # --- Prepare output dirs & CSV accumulator ---
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    sanitized = re.sub(r'[^A-Za-z0-9_\-]', '_', base)
+    unknown_dir = os.path.join(sanitized, "unknowns")
+    known_dir   = os.path.join(sanitized, "knowns")       
+    os.makedirs(unknown_dir, exist_ok=True)
+    os.makedirs(known_dir, exist_ok=True)         
 
-    db_index_path =  "D:\\milestone 2\\faiss_db\\logo_index.faiss"
-    metadata_path = "D:\\milestone 2\\faiss_db\\metadata.json"
-    db = LogoDatabase(db_index_path, metadata_path, device='cpu', batch_size=32)
+    detected_rows = []  # will collect rows for CSV
+    frame_results = []
+
+    # --- Initialize your components ---
+    shot_detector   = ShotDetector(video_path)
+    detector        = LogoDetector()
+    clip_model      = CLIPModel()
+
+    #Heuristic-based filtering of false positives
+    filter_pipeline = FilterPipeline([
+        area_aspect_filter,
+        texture_filter,
+        edge_density_filter,
+        color_variance_filter,
+    ])
+
+    db = LogoDatabaseNew(
+        index_path="D:\\milestone 2\\faiss_database_with_italian_logos\\logo_index.faiss",
+        metadata_path="D:\\milestone 2\\faiss_database_with_italian_logos\\metadata.json",
+        batch_size=64,
+        device='cpu', #Remove this if you want to use GPU
+    )
 
     audio_brands = extract_audio_brands(video_path)
+    # audio_brands = [
+    #     'sky','neoborocillina','storeroom','merluzzo','nurofen',
+    #     'monifarma','moneypharm','verishure','verisure','barbie',
+    #     'chanted evening','orogel','rai sport','rai 2','guinness world records'
+    # ]
     print(audio_brands)
-    
-    #Video Shot Detection
+
+    # 1) Shot detection → get frames, numbers, timestamps
     frames, frame_numbers, timestamps = shot_detector.process_video(quantile=threshold)
     print('Total Frames:', len(frames))
 
-    #Object detection on all frames
-    detector_results = detector.process_images(frames, threshold=0.02, nms_threshold=0.2, batch_size=16)
-    # print(len(detector_results))
-    # for result in detector_results:
-    #     print(len(result['logos']))
-    
-    frame_results = []
-    for result, timestamp, frame_no in tqdm(zip(detector_results, timestamps, frame_numbers)):
-        
+    # 2) Logo detection on all frames (batched)
+    detector_results = detector.process_images(
+        frames,
+        threshold=0.03,
+        nms_threshold=0.3,
+        batch_size=16
+    )
+
+    # 3) Per-frame loop
+    for frame, result, timestamp, frame_no in tqdm(
+        zip(frames, detector_results, timestamps, frame_numbers),
+        total=len(detector_results),
+        desc="Processing frames"
+    ):
         logos, scores = result['logos'], result['scores']
-        print("Total logos in frame: ", len(logos))
-        if len(logos) <= 0:
+        if not logos:
             continue
 
-        #Create LogoImage objects
+        # Compute frame area once
+        if isinstance(frame, Image.Image):
+            fw, fh = frame.size
+        else:  # assume numpy array HxWxC
+            fh, fw = frame.shape[:2]
+        frame_area = fw * fh
+
+        # 3a) Build LogoImage list *with* percent_area in metadata
         logo_images = []
-        for idx, (logo, score) in enumerate(zip(logos, scores)):
+        for idx, (crop_img, det_score) in enumerate(zip(logos, scores)):
+            w, h = (crop_img.size if isinstance(crop_img, Image.Image)
+                    else (crop_img.shape[1], crop_img.shape[0]))
+            percent_area = (w * h) / frame_area * 100.0
+
             metadata = {
-                'frame_number': frame_no,
-                'timestamp': timestamp,
-                'logo_index': idx,
-                'score': score,
+                'frame_number':  frame_no,
+                'timestamp':     timestamp,
+                'logo_index':    idx,
+                'detection_score': det_score,
+                'percent_area':  percent_area,
             }
-            logo_image = LogoImage.create(logo, metadata)
-            logo_images.append(logo_image)
-        
-        #Filter out easy examples using CLIP
+            logo_images.append(LogoImage.create(crop_img, metadata))
+
+        # 3b) Optional filtering
         if len(logo_images) >= 10:
-            logo_images = filter_logos_with_clip(logo_images, clip_model, positive_prompts, negative_prompts)
-            print(f"Filtered logos kept for frame {frame_no}: {len(logo_images)}")
-            
-        if len(logo_images) == 0:
+            logo_images = filter_pipeline.apply(logo_images)
+
+        if not logo_images or len(logo_images)==0:
             continue
-    
-        # Then run recognizer (same as earlier)
+
+        # 3c) Recognition via your stacked techniques
         techniques = [
             ClipTechnique(clip_model, clip_threshold=0.8),
-            OcrFuzzyTechnique(get_ocr_image, smart_fuzzy_brand_match, audio_brands, fuzzy_threshold=0.8),
-            # DatabaseFaissTechnique(db, get_ocr_image),
+            OcrFuzzyBatchTechnique(get_ocr_image, smart_fuzzy_brand_match_batch, audio_brands, fuzzy_threshold=0.8),
         ]
-
         if use_db:
-            techniques.append(DatabaseFaissTechnique(db, get_ocr_image))
+            techniques.append(DatabaseFaissTechniqueBatch(db, get_ocr_image))
 
         recognizer = BrandRecognizer(techniques)
-        frame_recognition_results = recognizer.recognize(logo_images)
+        recs = recognizer.recognize(logo_images)
 
+        # 3d) Enrich recs with percent_area, save unknowns & collect CSV rows
+        for logo in logo_images:
+            info = recs[logo.id]
+            # add percent_area to the result
+            info['percent_area'] = logo.metadata['percent_area']
+
+            if info['brand'] == 'UNKNOWN':
+                # save unknown crop
+                fname = f"frame{frame_no}_logo{logo.metadata['logo_index']}.png"
+                logo.image.save(os.path.join(unknown_dir, fname))
+            else:
+                # save known crop
+                fname = f"{logo.id}.png"                             # ← new
+                logo.image.save(os.path.join(known_dir, fname))      # ← new
+                # queue for CSV
+                detected_rows.append({
+                    'frame_number':  logo.metadata['frame_number'],
+                    'timestamp':     logo.metadata['timestamp'],
+                    'brand':         info['brand'],
+                    'percent_area':  logo.metadata['percent_area'],
+                    'filename':     fname,
+                })
+
+        # 3e) Append to overall frame_results
         frame_results.append({
             'frame_number': frame_no,
-            'timestamp': timestamp,
-            'results': frame_recognition_results
+            'timestamp':    timestamp,
+            'results':      recs
         })
 
+    # 4) Export known detections to CSV
+    if detected_rows:
+        df = pd.DataFrame(detected_rows)
+        # csv_path = os.path.join(sanitized, f"{sanitized}_detected_logos.csv")
+        csv_path = os.path.join(known_dir, f"{sanitized}_detected_logos.csv")
+        df.to_csv(csv_path, index=False)
+        print(f"▶ Exported {len(df)} detections to {csv_path}")
+    
     print(frame_results)
     return frame_results
-
-
 
 def process_frame_results_merged(frame_results, default_end_offset: float = 2.0) -> pd.DataFrame:
     """
