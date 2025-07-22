@@ -10,7 +10,7 @@ This is an application that allow detection of logos in non-English brand advert
 - Apply an LLM like `Qwen 2.5` to obtain all brand names mentioned in the audio transcript.
 - Run _shot detection_ on the video to obtain the most distinct, relevant keyframes.
 - On each keyframe, run a _zero-shot object detection_ model such as `OWLv2` with prompt to extract as many _logo-like_ regions as possible i.e. crops that may contain an actual logo.
-- Some of the regions that are not logos i.e. false positives are removed using CLIP-based filtering.
+- Some of the regions that are not logos i.e. false positives are removed using heuristic-based filtering (unrealistic aspect ratio, area, edge strength, etc).
 - All of the crops/regions then run through the following brand assignment techniques:
   - Use `CLIP` model to assign each region a brand from a list of top ~2000 brands (Netflix, Apple, etc.) obtained publicly from Kaggle.
   - Use `Optical Character Recognition (OCR)` along with `fuzzy string matching` to assign leftover regions a brand from the brand names extracted from the audio.
@@ -26,15 +26,16 @@ This is an application that allow detection of logos in non-English brand advert
 - Overall pipeline is agnostic to the domain (Ads, sports, etc.) and the source language.
 
  ## Challenges & Limitations
- - Some false positives obtained from OWLv2 pass unfiltered through the remaining pipeline.
+ - Some false positives obtained from OWLv2 are incorrectly assigned a brand name in the pipeline.
  - If a brand is not popular, not present in the vector store, and is not mentioned in the audio explicitly, it's logos will not be detected.
- - Currently, the pipeline runs slower than would be ideal. We are trying to implement optimizations such as replacing CLIP-based filtering with heuristic-based filtering, replacing EasyOCR with PaddleOCR, and using batched version of RapidFuzz for fuzzy matching.
+ - Currently, the pipeline runs slower than would be ideal. We are considering optimizations such as replacing EasyOCR with PaddleOCR, using multithreading, and combining regions from multiple consecutive frames to improve GPU utilization when using the brand recognition techniques.
 
 ## Usage
 1. Clone the Repository.
 2. Set up and activate a python virtual environment (optional).
 3. Run `pip install requirements.txt` to install the necessary dependencies.
-4. Run `gradio gradio_app.py` to launch the gradio UI.
+4. Note: You will need python 3.10 to use the GPU version of FAISS (faiss-gpu); python 3.11+ is currently not supported.
+5. Run `gradio gradio_app.py` to launch the gradio UI.
 6. Upload a short brand advertisement video of your choice.
 7. Type or copy-paste your `HuggingFace Hub` API key. You can obtain this for free.
 8. Click on `Run Pipeline` to run the pipeline.
