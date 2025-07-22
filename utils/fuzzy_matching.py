@@ -1,6 +1,7 @@
 from rapidfuzz import process, fuzz
 import easyocr
 import numpy as np
+from typing import List, Tuple, Dict
 
 reader = easyocr.Reader(['en'])  # language list
 
@@ -44,3 +45,96 @@ def robust_fuzzy_match(ocr_text: str, db_text: str, base_threshold=75, min_text_
         return db_text
 
     return "UNKNOWN"
+
+
+def smart_fuzzy_brand_match_batch(
+    texts: List[str],
+    brand_list: List[str],
+    base_threshold: int = 70
+) -> List[Tuple[str, int]]:
+    """
+    Quickly match each OCR text against known brands using a vectorized C++ backend.
+    Applies a higher threshold for very short texts to avoid spurious matches.
+
+    Args:
+        texts: List of OCR-extracted strings.
+        brand_list: List of known brand names (already lowercased).
+        base_threshold: Base fuzzy-match threshold (0-100). Short strings use base+15.
+
+    Returns:
+        List of (best_match, score) tuples, one per input text.
+        If no match meets the per-text threshold, returns ("UNKNOWN", best_score_or_0).
+    """
+    # Preprocess queries
+    queries = [t.strip().lower() for t in texts]
+    # Determine per-query thresholds"
+    thresholds = [base_threshold + 15 if len(q) < 4 else base_threshold for q in queries]
+
+    # Bulk compute pairwise scores >= base_threshold
+    raw_matches = process.cdist(
+        queries,
+        brand_list,
+        scorer=fuzz.WRatio,
+        processor=lambda s: s,
+        score_cutoff=base_threshold
+    )
+
+    best_match_score = np.max(raw_matches, axis=1)
+    best_match_index = np.argmax(raw_matches, axis=1)
+    is_matched = best_match_score > thresholds
+    
+    results = []
+    for i, is_match in enumerate(is_matched):
+        if is_match:
+            score = best_match_score[i]
+            brand = brand_list[best_match_index[i]]
+            results.append((brand, score))
+        else:
+            results.append(("UNKNOWN", best_match_score[i]))
+    return results
+
+
+# --- Batched fuzzy matcher ---
+def robust_fuzzy_match_batch(
+    ocr_texts: List[str],
+    db_texts: List[str],
+    base_threshold:    int = 75,
+    min_text_len:      int = 3,
+    partial_threshold: int = 80,
+    workers:           int = -1
+) -> List[str]:
+    """
+    Batchwise fuzzy matching of each OCR string against a single DB string.
+    Returns either the DB string or "UNKNOWN".
+    """
+    # Clean and length‐filter
+    ocr_clean = [t.strip() for t in ocr_texts]
+    lengths   = np.array([len(t) for t in ocr_clean])
+    results   = ["UNKNOWN"] * len(ocr_clean)
+
+    # Only match those long enough
+    mask = lengths >= min_text_len
+    if not mask.any():
+        return results
+
+    queries = [ocr_clean[i] for i in np.nonzero(mask)[0]]
+
+    # Compute WRatio & partial_ratio in parallel
+    full_scores    = process.cdist(queries, db_texts,    scorer=fuzz.WRatio,        workers=workers)
+    partial_scores = process.cdist(queries, db_texts,    scorer=fuzz.partial_ratio, workers=workers)
+
+    # For each query, pick best db index
+    best_idx     = full_scores.argmax(axis=1)
+    best_full    = full_scores[np.arange(full_scores.shape[0]), best_idx]
+    best_partial = partial_scores[np.arange(full_scores.shape[0]), best_idx]
+
+    # Apply thresholds
+    accept = (best_full >= base_threshold) & (best_partial >= partial_threshold)
+    short  = np.array([len(q) <= 3 for q in queries])
+    accept |= (short & (best_full >= base_threshold + 10))
+
+    valid_indices = np.nonzero(mask)[0]
+    for qi, orig_i in enumerate(valid_indices):
+        if accept[qi]:
+            results[orig_i] = db_texts[best_idx[qi]]
+    return results
